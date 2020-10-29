@@ -26,8 +26,10 @@ import android.util.Size;
 import android.view.OrientationEventListener;
 import android.view.Surface;
 import androidx.annotation.NonNull;
+import android.util.Range;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.plugins.camera.media.MediaRecorderBuilder;
 import io.flutter.view.TextureRegistry.SurfaceTextureEntry;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -58,6 +60,7 @@ public class Camera {
   private CaptureRequest.Builder captureRequestBuilder;
   private MediaRecorder mediaRecorder;
   private boolean recordingVideo;
+  private Range<Integer> aeFPSRange;
   private CamcorderProfile recordingProfile;
   private int currentOrientation = ORIENTATION_UNKNOWN;
 
@@ -82,7 +85,6 @@ public class Camera {
     if (activity == null) {
       throw new IllegalStateException("No activity available!");
     }
-
     this.cameraName = cameraName;
     this.enableAudio = enableAudio;
     this.flutterTexture = flutterTexture;
@@ -109,6 +111,7 @@ public class Camera {
     //noinspection ConstantConditions
     isFrontFacing =
         characteristics.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT;
+    setBestAERange(characteristics);
     ResolutionPreset preset = ResolutionPreset.valueOf(resolutionPreset);
     recordingProfile =
         CameraUtils.getBestAvailableCamcorderProfileForResolutionPreset(cameraName, preset);
@@ -116,27 +119,39 @@ public class Camera {
     previewSize = computeBestPreviewSize(cameraName, preset);
   }
 
+  private void setBestAERange(CameraCharacteristics characteristics) {
+    Range<Integer>[] fpsRanges =
+        characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+
+    if (fpsRanges.length <= 0) {
+      return;
+    }
+
+    Integer idx = 0;
+    Integer biggestDiference = 0;
+
+    for (Integer i = 0; i < fpsRanges.length; i++) {
+      Integer currentDifference = fpsRanges[i].getUpper() - fpsRanges[i].getLower();
+
+      if (currentDifference > biggestDiference) {
+        idx = i;
+        biggestDiference = currentDifference;
+      }
+    }
+
+    aeFPSRange = fpsRanges[idx];
+  }
+
   private void prepareMediaRecorder(String outputFilePath) throws IOException {
     if (mediaRecorder != null) {
       mediaRecorder.release();
     }
-    mediaRecorder = new MediaRecorder();
 
-    // There's a specific order that mediaRecorder expects. Do not change the order
-    // of these function calls.
-    if (enableAudio) mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-    mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
-    mediaRecorder.setOutputFormat(recordingProfile.fileFormat);
-    if (enableAudio) mediaRecorder.setAudioEncoder(recordingProfile.audioCodec);
-    mediaRecorder.setVideoEncoder(recordingProfile.videoCodec);
-    mediaRecorder.setVideoEncodingBitRate(recordingProfile.videoBitRate);
-    if (enableAudio) mediaRecorder.setAudioSamplingRate(recordingProfile.audioSampleRate);
-    mediaRecorder.setVideoFrameRate(recordingProfile.videoFrameRate);
-    mediaRecorder.setVideoSize(recordingProfile.videoFrameWidth, recordingProfile.videoFrameHeight);
-    mediaRecorder.setOutputFile(outputFilePath);
-    mediaRecorder.setOrientationHint(getMediaOrientation());
-
-    mediaRecorder.prepare();
+    mediaRecorder =
+        new MediaRecorderBuilder(recordingProfile, outputFilePath)
+            .setEnableAudio(enableAudio)
+            .setMediaOrientation(getMediaOrientation())
+            .build();
   }
 
   @SuppressLint("MissingPermission")
@@ -320,6 +335,12 @@ public class Camera {
               cameraCaptureSession = session;
               captureRequestBuilder.set(
                   CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+
+              if (Camera.this.aeFPSRange != null) {
+                captureRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Camera.this.aeFPSRange);
+              }
+
               cameraCaptureSession.setRepeatingRequest(captureRequestBuilder.build(), null, null);
               if (onSuccessCallback != null) {
                 onSuccessCallback.run();
@@ -421,8 +442,9 @@ public class Camera {
   }
 
   public void startPreview() throws CameraAccessException {
-    if (pictureImageReader != null)
-      createCaptureSession(CameraDevice.TEMPLATE_PREVIEW, pictureImageReader.getSurface());
+    if (pictureImageReader == null || pictureImageReader.getSurface() == null) return;
+
+    createCaptureSession(CameraDevice.TEMPLATE_PREVIEW, pictureImageReader.getSurface());
   }
 
   public void startPreviewWithImageStream(EventChannel imageStreamChannel)
